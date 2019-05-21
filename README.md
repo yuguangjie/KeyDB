@@ -64,7 +64,7 @@ KeyDB can be compiled and is tested for use on Linux.  KeyDB currently relies on
 
 Install dependencies:
 
-    % sudo apt install build-essential nasm autotools-dev autoconf libjemalloc-dev tcl tcl-dev uuid-dev
+    % sudo apt install build-essential nasm autotools-dev autoconf libjemalloc-dev tcl tcl-dev uuid-dev libcurl4-openssl-dev 
 
 Compiling is as simple as:
 
