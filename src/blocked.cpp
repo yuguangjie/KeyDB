@@ -64,6 +64,7 @@
  */
 
 #include "server.h"
+#include <mutex>
 
 int serveClientBlockedOnList(client *receiver, robj *key, robj *dstkey, redisDb *db, robj *value, int where);
 
@@ -180,6 +181,7 @@ void queueClientForReprocessing(client *c) {
  * of operation the client is blocking for. */
 void unblockClient(client *c) {
     serverAssert(GlobalLocksAcquired());
+    serverAssert(c->lock.fOwnLock());
     if (c->btype == BLOCKED_LIST ||
         c->btype == BLOCKED_ZSET ||
         c->btype == BLOCKED_STREAM) {
@@ -219,8 +221,8 @@ void replyToBlockedClientTimedOut(client *c) {
 
 /* Mass-unblock clients because something changed in the instance that makes
  * blocking no longer safe. For example clients blocked in list operations
- * in an instance which turns from master to slave is unsafe, so this function
- * is called when a master turns into a slave.
+ * in an instance which turns from master to replica is unsafe, so this function
+ * is called when a master turns into a replica.
  *
  * The semantics is to send an -UNBLOCKED error to the client, disconnecting
  * it at the same time. */
@@ -301,6 +303,7 @@ void handleClientsBlockedOnKeys(void) {
                     while(numclients--) {
                         listNode *clientnode = listFirst(clients);
                         client *receiver = (client*)clientnode->value;
+                        std::unique_lock<decltype(client::lock)> lock(receiver->lock);
 
                         if (receiver->btype != BLOCKED_LIST) {
                             /* Put at the tail, so that at the next call

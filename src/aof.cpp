@@ -97,6 +97,7 @@ void aofChildWriteDiffData(aeEventLoop *el, int fd, void *privdata, int mask) {
     aofrwblock *block;
     ssize_t nwritten;
     serverAssert(GlobalLocksAcquired());
+    serverAssert(el == g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN].el); // MUST run on main thread
 
     UNUSED(el);
     UNUSED(fd);
@@ -164,10 +165,7 @@ void aofRewriteBufferAppend(unsigned char *s, unsigned long len) {
 
     /* Install a file event to send data to the rewrite child if there is
      * not one already. */
-    if (aeGetFileEvents(serverTL->el,g_pserver->aof_pipe_write_data_to_child) == 0) {
-        aeCreateFileEvent(serverTL->el, g_pserver->aof_pipe_write_data_to_child,
-            AE_WRITABLE, aofChildWriteDiffData, NULL);
-    }
+    aeCreateRemoteFileEvent(g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN].el, g_pserver->aof_pipe_write_data_to_child, AE_WRITABLE, aofChildWriteDiffData, NULL, FALSE);
 }
 
 /* Write the buffer (possibly composed of multiple blocks) into the specified
@@ -668,7 +666,7 @@ client *createFakeClient(void) {
     c->flags = 0;
     c->fPendingAsyncWrite = FALSE;
     c->btype = BLOCKED_NONE;
-    /* We set the fake client as a slave waiting for the synchronization
+    /* We set the fake client as a replica waiting for the synchronization
      * so that Redis will not try to send replies to this client. */
     c->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
     c->reply = listCreate();
@@ -752,7 +750,7 @@ int loadAppendOnlyFile(char *filename) {
 
         serverLog(LL_NOTICE,"Reading RDB preamble from AOF file...");
         if (fseek(fp,0,SEEK_SET) == -1) goto readerr;
-        rioInitWithFile(&rdb,fileno(fp));
+        rioInitWithFile(&rdb,fp);
         rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
         if (rdbLoadRio(&rdb,&rsi,1) != C_OK) {
             serverLog(LL_WARNING,"Error reading the RDB preamble of the AOF file, AOF loading aborted");
@@ -1321,13 +1319,12 @@ int rewriteAppendOnlyFileRio(rio *aof) {
         while((de = dictNext(di)) != NULL) {
             sds keystr;
             robj key, *o;
-            long long expiretime;
 
             keystr = (sds)dictGetKey(de);
             o = (robj*)dictGetVal(de);
             initStaticStringObject(key,keystr);
 
-            expiretime = getExpire(db,&key);
+            expireEntry *pexpire = getExpire(db,&key);
 
             /* Save the key and associated value */
             if (o->type == OBJ_STRING) {
@@ -1353,11 +1350,23 @@ int rewriteAppendOnlyFileRio(rio *aof) {
                 serverPanic("Unknown object type");
             }
             /* Save the expire time */
-            if (expiretime != -1) {
-                char cmd[]="*3\r\n$9\r\nPEXPIREAT\r\n";
-                if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) goto werr;
-                if (rioWriteBulkObject(aof,&key) == 0) goto werr;
-                if (rioWriteBulkLongLong(aof,expiretime) == 0) goto werr;
+            if (pexpire != nullptr) {
+                for (auto &subExpire : *pexpire) {
+                    if (subExpire.subkey() == nullptr)
+                    {
+                        char cmd[]="*3\r\n$9\r\nPEXPIREAT\r\n";
+                        if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) goto werr;
+                        if (rioWriteBulkObject(aof,&key) == 0) goto werr;
+                    }
+                    else
+                    {
+                        char cmd[]="*4\r\n$12\r\nEXPIREMEMBER\r\n";
+                        if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) goto werr;
+                        if (rioWriteBulkObject(aof,&key) == 0) goto werr;
+                        if (rioWrite(aof,subExpire.subkey(),sdslen(subExpire.subkey())) == 0) goto werr;
+                    }
+                    if (rioWriteBulkLongLong(aof,subExpire.when()) == 0) goto werr; // common
+                }
             }
             /* Read some diff from the parent process from time to time. */
             if (aof->processed_bytes > processed+AOF_READ_DIFF_INTERVAL_BYTES) {
@@ -1400,7 +1409,7 @@ int rewriteAppendOnlyFile(char *filename) {
     }
 
     g_pserver->aof_child_diff = sdsempty();
-    rioInitWithFile(&aof,fileno(fp));
+    rioInitWithFile(&aof,fp);
 
     if (g_pserver->aof_rewrite_incremental_fsync)
         rioSetAutoSync(&aof,REDIS_AUTOSYNC_BYTES);
@@ -1508,7 +1517,7 @@ void aofChildPipeReadable(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
     /* Remove the handler since this can be called only one time during a
      * rewrite. */
-    aeDeleteFileEventAsync(g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN].el,g_pserver->aof_pipe_read_ack_from_child,AE_READABLE);
+    aeDeleteFileEvent(el,g_pserver->aof_pipe_read_ack_from_child,AE_READABLE);
 }
 
 /* Create the pipes used for parent - child process IPC during rewrite.
@@ -1546,12 +1555,20 @@ error:
 }
 
 void aofClosePipes(void) {
-    aeDeleteFileEventAsync(g_pserver->el_alf_pip_read_ack_from_child,g_pserver->aof_pipe_read_ack_from_child,AE_READABLE);
-    aeDeleteFileEventAsync(g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN].el,g_pserver->aof_pipe_write_data_to_child,AE_WRITABLE);
-    close(g_pserver->aof_pipe_write_data_to_child);
+    int fdAofAckPipe = g_pserver->aof_pipe_read_ack_from_child;
+    aePostFunction(g_pserver->el_alf_pip_read_ack_from_child, [fdAofAckPipe]{
+        aeDeleteFileEventAsync(serverTL->el,fdAofAckPipe,AE_READABLE);
+        close (fdAofAckPipe);
+    });
+
+    int fdAofWritePipe = g_pserver->aof_pipe_write_data_to_child;
+    aePostFunction(g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN].el, [fdAofWritePipe]{
+        aeDeleteFileEventAsync(serverTL->el,fdAofWritePipe,AE_WRITABLE);
+        close(fdAofWritePipe);
+    });
+    
     close(g_pserver->aof_pipe_read_data_from_parent);
     close(g_pserver->aof_pipe_write_ack_to_parent);
-    close(g_pserver->aof_pipe_read_ack_from_child);
     close(g_pserver->aof_pipe_write_ack_to_child);
     close(g_pserver->aof_pipe_read_ack_from_parent);
 }

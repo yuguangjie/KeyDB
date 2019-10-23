@@ -71,9 +71,9 @@ extern "C" {
 #define REDISMODULE_CTX_FLAGS_MULTI (1<<1)
 /* The instance is a master */
 #define REDISMODULE_CTX_FLAGS_MASTER (1<<2)
-/* The instance is a slave */
+/* The instance is a replica */
 #define REDISMODULE_CTX_FLAGS_SLAVE (1<<3)
-/* The instance is read-only (usually meaning it's a slave as well) */
+/* The instance is read-only (usually meaning it's a replica as well) */
 #define REDISMODULE_CTX_FLAGS_READONLY (1<<4)
 /* The instance is running in cluster mode */
 #define REDISMODULE_CTX_FLAGS_CLUSTER (1<<5)
@@ -91,6 +91,8 @@ extern "C" {
 #define REDISMODULE_CTX_FLAGS_OOM_WARNING (1<<11)
 /* The command was sent over the replication link. */
 #define REDISMODULE_CTX_FLAGS_REPLICATED (1<<12)
+/* Redis is currently loading either from AOF or RDB. */
+#define REDISMODULE_CTX_FLAGS_LOADING (1<<13)
 
 
 #define REDISMODULE_NOTIFY_GENERIC (1<<2)     /* g */
@@ -230,6 +232,7 @@ int REDISMODULE_API_FUNC(RedisModule_ReplyWithSimpleString)(RedisModuleCtx *ctx,
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithArray)(RedisModuleCtx *ctx, long len);
 void REDISMODULE_API_FUNC(RedisModule_ReplySetArrayLength)(RedisModuleCtx *ctx, long len);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithStringBuffer)(RedisModuleCtx *ctx, const char *buf, size_t len);
+int REDISMODULE_API_FUNC(RedisModule_ReplyWithCString)(RedisModuleCtx *ctx, const char *buf);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithString)(RedisModuleCtx *ctx, RedisModuleString *str);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithNull)(RedisModuleCtx *ctx);
 int REDISMODULE_API_FUNC(RedisModule_ReplyWithDouble)(RedisModuleCtx *ctx, double d);
@@ -380,6 +383,7 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(ReplyWithArray);
     REDISMODULE_GET_API(ReplySetArrayLength);
     REDISMODULE_GET_API(ReplyWithStringBuffer);
+    REDISMODULE_GET_API(ReplyWithCString);
     REDISMODULE_GET_API(ReplyWithString);
     REDISMODULE_GET_API(ReplyWithNull);
     REDISMODULE_GET_API(ReplyWithCallReply);

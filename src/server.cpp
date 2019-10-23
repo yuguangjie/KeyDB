@@ -59,7 +59,10 @@
 #include <sys/socket.h>
 #include <algorithm>
 #include <uuid/uuid.h>
+#include <mutex>
 #include "aelocker.h"
+
+int g_fTestMode = false;
 
 /* Our shared "common" objects */
 
@@ -151,7 +154,7 @@ volatile unsigned long lru_clock; /* Server global current LRU time. */
  *
  * ok-loading:  Allow the command while loading the database.
  *
- * ok-stale:    Allow the command while a slave has stale data but is not
+ * ok-stale:    Allow the command while a replica has stale data but is not
  *              allowed to serve this data. Normally no command is accepted
  *              in this condition but just a few.
  *
@@ -223,6 +226,10 @@ struct redisCommand redisCommandTable[] = {
      0,NULL,1,1,1,0,0,0},
 
     {"del",delCommand,-2,
+     "write @keyspace",
+     0,NULL,1,-1,1,0,0,0},
+
+    {"expdel",delCommand,-2,
      "write @keyspace",
      0,NULL,1,-1,1,0,0,0},
 
@@ -616,6 +623,14 @@ struct redisCommand redisCommandTable[] = {
      "write fast @keyspace",
      0,NULL,1,1,1,0,0,0},
 
+    {"expiremember", expireMemberCommand, -4,
+     "write fast @keyspace",
+     0,NULL,1,1,1,0,0,0},
+    
+    {"expirememberat", expireMemberAtCommand, 4,
+     "write fast @keyspace",
+     0,NULL,1,1,1,0,0,0},
+
     {"pexpire",pexpireCommand,3,
      "write fast @keyspace",
      0,NULL,1,1,1,0,0,0},
@@ -719,7 +734,7 @@ struct redisCommand redisCommandTable[] = {
      "admin no-script",
      0,NULL,0,0,0,0,0,0},
 
-    {"ttl",ttlCommand,2,
+    {"ttl",ttlCommand,-2,
      "read-only fast random @keyspace",
      0,NULL,1,1,1,0,0,0},
 
@@ -727,11 +742,11 @@ struct redisCommand redisCommandTable[] = {
      "read-only fast @keyspace",
      0,NULL,1,-1,1,0,0,0},
 
-    {"pttl",pttlCommand,2,
+    {"pttl",pttlCommand,-2,
      "read-only fast random @keyspace",
      0,NULL,1,1,1,0,0,0},
 
-    {"persist",persistCommand,2,
+    {"persist",persistCommand,-2,
      "write fast @keyspace",
      0,NULL,1,1,1,0,0,0},
 
@@ -1021,7 +1036,7 @@ extern "C" void nolocks_localtime(struct tm *tmp, time_t t, time_t tz, int dst);
  * serverLog() is to prefer. */
 void serverLogRaw(int level, const char *msg) {
     const int syslogLevelMap[] = { LOG_DEBUG, LOG_INFO, LOG_NOTICE, LOG_WARNING };
-    const char *c = ".-*#";
+    const char *c = ".-*#                                                             ";
     FILE *fp;
     char buf[64];
     int rawmode = (level & LL_RAW);
@@ -1426,8 +1441,6 @@ int htNeedsResize(dict *dict) {
 void tryResizeHashTables(int dbid) {
     if (htNeedsResize(g_pserver->db[dbid].pdict))
         dictResize(g_pserver->db[dbid].pdict);
-    if (htNeedsResize(g_pserver->db[dbid].expires))
-        dictResize(g_pserver->db[dbid].expires);
 }
 
 /* Our hash table implementation performs rehashing incrementally while
@@ -1441,11 +1454,6 @@ int incrementallyRehash(int dbid) {
     /* Keys dictionary */
     if (dictIsRehashing(g_pserver->db[dbid].pdict)) {
         dictRehashMilliseconds(g_pserver->db[dbid].pdict,1);
-        return 1; /* already used our millisecond for this loop... */
-    }
-    /* Expires */
-    if (dictIsRehashing(g_pserver->db[dbid].expires)) {
-        dictRehashMilliseconds(g_pserver->db[dbid].expires,1);
         return 1; /* already used our millisecond for this loop... */
     }
     return 0;
@@ -1747,7 +1755,8 @@ void databasesCron(void) {
  * a lot faster than calling time(NULL) */
 void updateCachedTime(void) {
     g_pserver->unixtime = time(NULL);
-    g_pserver->mstime = mstime();
+    long long ms = mstime();
+    __atomic_store(&g_pserver->mstime, &ms, __ATOMIC_RELAXED);
 
     /* To get information about daylight saving time, we need to call
      * localtime_r and cache the result. However calling localtime_r in this
@@ -1784,6 +1793,15 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(eventLoop);
     UNUSED(id);
     UNUSED(clientData);
+
+    /* If another threads unblocked one of our clients, and this thread has been idle
+        then beforeSleep won't have a chance to process the unblocking.  So we also
+        process them here in the cron job to ensure they don't starve.
+    */
+    if (listLength(g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN].unblocked_clients))
+    {
+        processUnblockedClients(IDX_EVENT_LOOP_MAIN);
+    }
 
     ProcessPendingAsyncWrites();    // This is really a bug, but for now catch any laggards that didn't clean up
         
@@ -1877,7 +1895,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 
             size = dictSlots(g_pserver->db[j].pdict);
             used = dictSize(g_pserver->db[j].pdict);
-            vkeys = dictSize(g_pserver->db[j].expires);
+            vkeys = g_pserver->db[j].setexpire->size();
             if (used || vkeys) {
                 serverLog(LL_VERBOSE,"DB %d: %lld keys (%lld volatile) in %lld slots HT.",j,used,vkeys,size);
                 /* dictPrintStats(g_pserver->dict); */
@@ -2001,9 +2019,6 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             flushAppendOnlyFile(0);
     }
 
-    /* Close clients that need to be closed asynchronous */
-    freeClientsInAsyncFreeQueue(IDX_EVENT_LOOP_MAIN);
-
     /* Clear the paused clients flag if needed. */
     clientsArePaused(); /* Don't check return value, just use the side effect.*/
 
@@ -2054,11 +2069,18 @@ int serverCronLite(struct aeEventLoop *eventLoop, long long id, void *clientData
 
     int iel = ielFromEventLoop(eventLoop);
     serverAssert(iel != IDX_EVENT_LOOP_MAIN);
+
+    /* If another threads unblocked one of our clients, and this thread has been idle
+        then beforeSleep won't have a chance to process the unblocking.  So we also
+        process them here in the cron job to ensure they don't starve.
+    */
+    if (listLength(g_pserver->rgthreadvar[iel].unblocked_clients))
+    {
+        processUnblockedClients(iel);
+    }
     
     ProcessPendingAsyncWrites();    // A bug but leave for now, events should clean up after themselves
     clientsCron(iel);
-
-    freeClientsInAsyncFreeQueue(iel);
 
     return 1000/g_pserver->hz;
 }
@@ -2088,7 +2110,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         argv[0] = createStringObject("REPLCONF",8);
         argv[1] = createStringObject("GETACK",6);
         argv[2] = createStringObject("*",1); /* Not used argument. */
-        replicationFeedSlaves(g_pserver->slaves, g_pserver->slaveseldb, argv, 3);
+        replicationFeedSlaves(g_pserver->slaves, g_pserver->replicaseldb, argv, 3);
         decrRefCount(argv[0]);
         decrRefCount(argv[1]);
         decrRefCount(argv[2]);
@@ -2169,99 +2191,99 @@ void afterSleep(struct aeEventLoop *eventLoop) {
 void createSharedObjects(void) {
     int j;
 
-    shared.crlf = createObject(OBJ_STRING,sdsnew("\r\n"));
-    shared.ok = createObject(OBJ_STRING,sdsnew("+OK\r\n"));
-    shared.err = createObject(OBJ_STRING,sdsnew("-ERR\r\n"));
-    shared.emptybulk = createObject(OBJ_STRING,sdsnew("$0\r\n\r\n"));
-    shared.emptymultibulk = createObject(OBJ_STRING,sdsnew("*0\r\n"));
-    shared.nullbulk = createObject(OBJ_STRING,sdsnew("$0\r\n\r\n"));
-    shared.czero = createObject(OBJ_STRING,sdsnew(":0\r\n"));
-    shared.cone = createObject(OBJ_STRING,sdsnew(":1\r\n"));
-    shared.emptyarray = createObject(OBJ_STRING,sdsnew("*0\r\n"));
-    shared.pong = createObject(OBJ_STRING,sdsnew("+PONG\r\n"));
-    shared.queued = createObject(OBJ_STRING,sdsnew("+QUEUED\r\n"));
-    shared.emptyscan = createObject(OBJ_STRING,sdsnew("*2\r\n$1\r\n0\r\n*0\r\n"));
-    shared.wrongtypeerr = createObject(OBJ_STRING,sdsnew(
-        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"));
-    shared.nokeyerr = createObject(OBJ_STRING,sdsnew(
-        "-ERR no such key\r\n"));
-    shared.syntaxerr = createObject(OBJ_STRING,sdsnew(
-        "-ERR syntax error\r\n"));
-    shared.sameobjecterr = createObject(OBJ_STRING,sdsnew(
-        "-ERR source and destination objects are the same\r\n"));
-    shared.outofrangeerr = createObject(OBJ_STRING,sdsnew(
-        "-ERR index out of range\r\n"));
-    shared.noscripterr = createObject(OBJ_STRING,sdsnew(
-        "-NOSCRIPT No matching script. Please use EVAL.\r\n"));
-    shared.loadingerr = createObject(OBJ_STRING,sdsnew(
-        "-LOADING Redis is loading the dataset in memory\r\n"));
-    shared.slowscripterr = createObject(OBJ_STRING,sdsnew(
-        "-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\r\n"));
-    shared.masterdownerr = createObject(OBJ_STRING,sdsnew(
-        "-MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n"));
-    shared.bgsaveerr = createObject(OBJ_STRING,sdsnew(
-        "-MISCONF Redis is configured to save RDB snapshots, but it is currently not able to persist on disk. Commands that may modify the data set are disabled, because this instance is configured to report errors during writes if RDB snapshotting fails (stop-writes-on-bgsave-error option). Please check the Redis logs for details about the RDB error.\r\n"));
-    shared.roslaveerr = createObject(OBJ_STRING,sdsnew(
-        "-READONLY You can't write against a read only replica.\r\n"));
-    shared.noautherr = createObject(OBJ_STRING,sdsnew(
-        "-NOAUTH Authentication required.\r\n"));
-    shared.oomerr = createObject(OBJ_STRING,sdsnew(
-        "-OOM command not allowed when used memory > 'maxmemory'.\r\n"));
-    shared.execaborterr = createObject(OBJ_STRING,sdsnew(
-        "-EXECABORT Transaction discarded because of previous errors.\r\n"));
-    shared.noreplicaserr = createObject(OBJ_STRING,sdsnew(
-        "-NOREPLICAS Not enough good replicas to write.\r\n"));
-    shared.busykeyerr = createObject(OBJ_STRING,sdsnew(
-        "-BUSYKEY Target key name already exists.\r\n"));
-    shared.space = createObject(OBJ_STRING,sdsnew(" "));
-    shared.colon = createObject(OBJ_STRING,sdsnew(":"));
-    shared.plus = createObject(OBJ_STRING,sdsnew("+"));
+    shared.crlf = makeObjectShared(createObject(OBJ_STRING,sdsnew("\r\n")));
+    shared.ok = makeObjectShared(createObject(OBJ_STRING,sdsnew("+OK\r\n")));
+    shared.err = makeObjectShared(createObject(OBJ_STRING,sdsnew("-ERR\r\n")));
+    shared.emptybulk = makeObjectShared(createObject(OBJ_STRING,sdsnew("$0\r\n\r\n")));
+    shared.emptymultibulk = makeObjectShared(createObject(OBJ_STRING,sdsnew("*0\r\n")));
+    shared.nullbulk = makeObjectShared(createObject(OBJ_STRING,sdsnew("$0\r\n\r\n")));
+    shared.czero = makeObjectShared(createObject(OBJ_STRING,sdsnew(":0\r\n")));
+    shared.cone = makeObjectShared(createObject(OBJ_STRING,sdsnew(":1\r\n")));
+    shared.emptyarray = makeObjectShared(createObject(OBJ_STRING,sdsnew("*0\r\n")));
+    shared.pong = makeObjectShared(createObject(OBJ_STRING,sdsnew("+PONG\r\n")));
+    shared.queued = makeObjectShared(createObject(OBJ_STRING,sdsnew("+QUEUED\r\n")));
+    shared.emptyscan = makeObjectShared(createObject(OBJ_STRING,sdsnew("*2\r\n$1\r\n0\r\n*0\r\n")));
+    shared.wrongtypeerr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")));
+    shared.nokeyerr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-ERR no such key\r\n")));
+    shared.syntaxerr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-ERR syntax error\r\n")));
+    shared.sameobjecterr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-ERR source and destination objects are the same\r\n")));
+    shared.outofrangeerr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-ERR index out of range\r\n")));
+    shared.noscripterr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-NOSCRIPT No matching script. Please use EVAL.\r\n")));
+    shared.loadingerr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-LOADING Redis is loading the dataset in memory\r\n")));
+    shared.slowscripterr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\r\n")));
+    shared.masterdownerr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n")));
+    shared.bgsaveerr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-MISCONF Redis is configured to save RDB snapshots, but it is currently not able to persist on disk. Commands that may modify the data set are disabled, because this instance is configured to report errors during writes if RDB snapshotting fails (stop-writes-on-bgsave-error option). Please check the Redis logs for details about the RDB error.\r\n")));
+    shared.roslaveerr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-READONLY You can't write against a read only replica.\r\n")));
+    shared.noautherr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-NOAUTH Authentication required.\r\n")));
+    shared.oomerr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-OOM command not allowed when used memory > 'maxmemory'.\r\n")));
+    shared.execaborterr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-EXECABORT Transaction discarded because of previous errors.\r\n")));
+    shared.noreplicaserr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-NOREPLICAS Not enough good replicas to write.\r\n")));
+    shared.busykeyerr = makeObjectShared(createObject(OBJ_STRING,sdsnew(
+        "-BUSYKEY Target key name already exists.\r\n")));
+    shared.space = makeObjectShared(createObject(OBJ_STRING,sdsnew(" ")));
+    shared.colon = makeObjectShared(createObject(OBJ_STRING,sdsnew(":")));
+    shared.plus = makeObjectShared(createObject(OBJ_STRING,sdsnew("+")));
 
     /* The shared NULL depends on the protocol version. */
     shared.null[0] = NULL;
     shared.null[1] = NULL;
-    shared.null[2] = createObject(OBJ_STRING,sdsnew("$-1\r\n"));
-    shared.null[3] = createObject(OBJ_STRING,sdsnew("_\r\n"));
+    shared.null[2] = makeObjectShared(createObject(OBJ_STRING,sdsnew("$-1\r\n")));
+    shared.null[3] = makeObjectShared(createObject(OBJ_STRING,sdsnew("_\r\n")));
 
     shared.nullarray[0] = NULL;
     shared.nullarray[1] = NULL;
-    shared.nullarray[2] = createObject(OBJ_STRING,sdsnew("*-1\r\n"));
-    shared.nullarray[3] = createObject(OBJ_STRING,sdsnew("_\r\n"));
+    shared.nullarray[2] = makeObjectShared(createObject(OBJ_STRING,sdsnew("*-1\r\n")));
+    shared.nullarray[3] = makeObjectShared(createObject(OBJ_STRING,sdsnew("_\r\n")));
 
     for (j = 0; j < PROTO_SHARED_SELECT_CMDS; j++) {
         char dictid_str[64];
         int dictid_len;
 
         dictid_len = ll2string(dictid_str,sizeof(dictid_str),j);
-        shared.select[j] = createObject(OBJ_STRING,
+        shared.select[j] = makeObjectShared(createObject(OBJ_STRING,
             sdscatprintf(sdsempty(),
                 "*2\r\n$6\r\nSELECT\r\n$%d\r\n%s\r\n",
-                dictid_len, dictid_str));
+                dictid_len, dictid_str)));
     }
-    shared.messagebulk = createStringObject("$7\r\nmessage\r\n",13);
-    shared.pmessagebulk = createStringObject("$8\r\npmessage\r\n",14);
-    shared.subscribebulk = createStringObject("$9\r\nsubscribe\r\n",15);
-    shared.unsubscribebulk = createStringObject("$11\r\nunsubscribe\r\n",18);
-    shared.psubscribebulk = createStringObject("$10\r\npsubscribe\r\n",17);
-    shared.punsubscribebulk = createStringObject("$12\r\npunsubscribe\r\n",19);
-    shared.del = createStringObject("DEL",3);
-    shared.unlink = createStringObject("UNLINK",6);
-    shared.rpop = createStringObject("RPOP",4);
-    shared.lpop = createStringObject("LPOP",4);
-    shared.lpush = createStringObject("LPUSH",5);
-    shared.rpoplpush = createStringObject("RPOPLPUSH",9);
-    shared.zpopmin = createStringObject("ZPOPMIN",7);
-    shared.zpopmax = createStringObject("ZPOPMAX",7);
+    shared.messagebulk = makeObjectShared(createStringObject("$7\r\nmessage\r\n",13));
+    shared.pmessagebulk = makeObjectShared(createStringObject("$8\r\npmessage\r\n",14));
+    shared.subscribebulk = makeObjectShared(createStringObject("$9\r\nsubscribe\r\n",15));
+    shared.unsubscribebulk = makeObjectShared(createStringObject("$11\r\nunsubscribe\r\n",18));
+    shared.psubscribebulk = makeObjectShared(createStringObject("$10\r\npsubscribe\r\n",17));
+    shared.punsubscribebulk = makeObjectShared(createStringObject("$12\r\npunsubscribe\r\n",19));
+    shared.del = makeObjectShared(createStringObject("DEL",3));
+    shared.unlink = makeObjectShared(createStringObject("UNLINK",6));
+    shared.rpop = makeObjectShared(createStringObject("RPOP",4));
+    shared.lpop = makeObjectShared(createStringObject("LPOP",4));
+    shared.lpush = makeObjectShared(createStringObject("LPUSH",5));
+    shared.rpoplpush = makeObjectShared(createStringObject("RPOPLPUSH",9));
+    shared.zpopmin = makeObjectShared(createStringObject("ZPOPMIN",7));
+    shared.zpopmax = makeObjectShared(createStringObject("ZPOPMAX",7));
     for (j = 0; j < OBJ_SHARED_INTEGERS; j++) {
         shared.integers[j] =
             makeObjectShared(createObject(OBJ_STRING,(void*)(long)j));
         shared.integers[j]->encoding = OBJ_ENCODING_INT;
     }
     for (j = 0; j < OBJ_SHARED_BULKHDR_LEN; j++) {
-        shared.mbulkhdr[j] = createObject(OBJ_STRING,
-            sdscatprintf(sdsempty(),"*%d\r\n",j));
-        shared.bulkhdr[j] = createObject(OBJ_STRING,
-            sdscatprintf(sdsempty(),"$%d\r\n",j));
+        shared.mbulkhdr[j] = makeObjectShared(createObject(OBJ_STRING,
+            sdscatprintf(sdsempty(),"*%d\r\n",j)));
+        shared.bulkhdr[j] = makeObjectShared(createObject(OBJ_STRING,
+            sdscatprintf(sdsempty(),"$%d\r\n",j)));
     }
     /* The following two shared objects, minstring and maxstrings, are not
      * actually used for their value but as a special object meaning
@@ -2493,27 +2515,13 @@ void initServerConfig(void) {
 
     /* By default we want scripts to be always replicated by effects
      * (single commands executed by the script), and not by sending the
-     * script to the slave / AOF. This is the new way starting from
+     * script to the replica / AOF. This is the new way starting from
      * Redis 5. However it is possible to revert it via redis.conf. */
     g_pserver->lua_always_replicate_commands = 1;
 
     /* Multithreading */
     cserver.cthreads = CONFIG_DEFAULT_THREADS;
     cserver.fThreadAffinity = CONFIG_DEFAULT_THREAD_AFFINITY;
-
-    g_pserver->db = (redisDb*)zmalloc(sizeof(redisDb)*cserver.dbnum, MALLOC_LOCAL);
-
-    /* Create the Redis databases, and initialize other internal state. */
-    for (int j = 0; j < cserver.dbnum; j++) {
-        g_pserver->db[j].pdict = dictCreate(&dbDictType,NULL);
-        g_pserver->db[j].expires = dictCreate(&keyptrDictType,NULL);
-        g_pserver->db[j].blocking_keys = dictCreate(&keylistDictType,NULL);
-        g_pserver->db[j].ready_keys = dictCreate(&objectKeyPointerValueDictType,NULL);
-        g_pserver->db[j].watched_keys = dictCreate(&keylistDictType,NULL);
-        g_pserver->db[j].id = j;
-        g_pserver->db[j].avg_ttl = 0;
-        g_pserver->db[j].defrag_later = listCreate();
-    }
 }
 
 extern char **environ;
@@ -2700,7 +2708,7 @@ void checkTcpBacklogSettings(void) {
  * impossible to bind, or no bind addresses were specified in the server
  * configuration but the function is not able to bind * for at least
  * one of the IPv4 or IPv6 protocols. */
-int listenToPort(int port, int *fds, int *count, int fReusePort) {
+int listenToPort(int port, int *fds, int *count, int fReusePort, int fFirstListen) {
     int j;
 
     /* Force binding of 0.0.0.0 if no bind address is specified, always
@@ -2711,8 +2719,8 @@ int listenToPort(int port, int *fds, int *count, int fReusePort) {
             int unsupported = 0;
             /* Bind * for both IPv6 and IPv4, we enter here only if
              * g_pserver->bindaddr_count == 0. */
-            fds[*count] = anetTcp6Server(g_pserver->neterr,port,NULL,
-                g_pserver->tcp_backlog, fReusePort);
+            fds[*count] = anetTcp6Server(serverTL->neterr,port,NULL,
+                g_pserver->tcp_backlog, fReusePort, fFirstListen);
             if (fds[*count] != ANET_ERR) {
                 anetNonBlock(NULL,fds[*count]);
                 (*count)++;
@@ -2723,8 +2731,8 @@ int listenToPort(int port, int *fds, int *count, int fReusePort) {
 
             if (*count == 1 || unsupported) {
                 /* Bind the IPv4 address as well. */
-                fds[*count] = anetTcpServer(g_pserver->neterr,port,NULL,
-                    g_pserver->tcp_backlog, fReusePort);
+                fds[*count] = anetTcpServer(serverTL->neterr,port,NULL,
+                    g_pserver->tcp_backlog, fReusePort, fFirstListen);
                 if (fds[*count] != ANET_ERR) {
                     anetNonBlock(NULL,fds[*count]);
                     (*count)++;
@@ -2739,18 +2747,18 @@ int listenToPort(int port, int *fds, int *count, int fReusePort) {
             if (*count + unsupported == 2) break;
         } else if (strchr(g_pserver->bindaddr[j],':')) {
             /* Bind IPv6 address. */
-            fds[*count] = anetTcp6Server(g_pserver->neterr,port,g_pserver->bindaddr[j],
-                g_pserver->tcp_backlog, fReusePort);
+            fds[*count] = anetTcp6Server(serverTL->neterr,port,g_pserver->bindaddr[j],
+                g_pserver->tcp_backlog, fReusePort, fFirstListen);
         } else {
             /* Bind IPv4 address. */
-            fds[*count] = anetTcpServer(g_pserver->neterr,port,g_pserver->bindaddr[j],
-                g_pserver->tcp_backlog, fReusePort);
+            fds[*count] = anetTcpServer(serverTL->neterr,port,g_pserver->bindaddr[j],
+                g_pserver->tcp_backlog, fReusePort, fFirstListen);
         }
         if (fds[*count] == ANET_ERR) {
             serverLog(LL_WARNING,
                 "Could not create server TCP listening socket %s:%d: %s",
                 g_pserver->bindaddr[j] ? g_pserver->bindaddr[j] : "*",
-                port, g_pserver->neterr);
+                port, serverTL->neterr);
                 if (errno == ENOPROTOOPT     || errno == EPROTONOSUPPORT ||
                     errno == ESOCKTNOSUPPORT || errno == EPFNOSUPPORT ||
                     errno == EAFNOSUPPORT    || errno == EADDRNOTAVAIL)
@@ -2806,7 +2814,7 @@ static void initNetworkingThread(int iel, int fReusePort)
     if (fReusePort || (iel == IDX_EVENT_LOOP_MAIN))
     {
         if (g_pserver->port != 0 &&
-            listenToPort(g_pserver->port,g_pserver->rgthreadvar[iel].ipfd,&g_pserver->rgthreadvar[iel].ipfd_count, fReusePort) == C_ERR)
+            listenToPort(g_pserver->port,g_pserver->rgthreadvar[iel].ipfd,&g_pserver->rgthreadvar[iel].ipfd_count, fReusePort, (iel == IDX_EVENT_LOOP_MAIN)) == C_ERR)
             exit(1);
     }
     else
@@ -2836,10 +2844,10 @@ static void initNetworking(int fReusePort)
     /* Open the listening Unix domain socket. */
     if (g_pserver->unixsocket != NULL) {
         unlink(g_pserver->unixsocket); /* don't care if this fails */
-        g_pserver->sofd = anetUnixServer(g_pserver->neterr,g_pserver->unixsocket,
+        g_pserver->sofd = anetUnixServer(serverTL->neterr,g_pserver->unixsocket,
             g_pserver->unixsocketperm, g_pserver->tcp_backlog);
         if (g_pserver->sofd == ANET_ERR) {
-            serverLog(LL_WARNING, "Opening Unix socket: %s", g_pserver->neterr);
+            serverLog(LL_WARNING, "Opening Unix socket: %s", serverTL->neterr);
             exit(1);
         }
         anetNonBlock(NULL,g_pserver->sofd);
@@ -2919,6 +2927,35 @@ void initServer(void) {
 
     fastlock_init(&g_pserver->flock);
 
+    g_pserver->db = (redisDb*)zmalloc(sizeof(redisDb)*cserver.dbnum, MALLOC_LOCAL);
+
+    /* Create the Redis databases, and initialize other internal state. */
+    for (int j = 0; j < cserver.dbnum; j++) {
+        new (&g_pserver->db[j]) redisDb;
+        g_pserver->db[j].pdict = dictCreate(&dbDictType,NULL);
+        g_pserver->db[j].setexpire = new(MALLOC_LOCAL) expireset();
+        g_pserver->db[j].expireitr = g_pserver->db[j].setexpire->end();
+        g_pserver->db[j].blocking_keys = dictCreate(&keylistDictType,NULL);
+        g_pserver->db[j].ready_keys = dictCreate(&objectKeyPointerValueDictType,NULL);
+        g_pserver->db[j].watched_keys = dictCreate(&keylistDictType,NULL);
+        g_pserver->db[j].id = j;
+        g_pserver->db[j].avg_ttl = 0;
+        g_pserver->db[j].last_expire_set = 0;
+        g_pserver->db[j].defrag_later = listCreate();
+    }
+
+    /* Fixup Master Client Database */
+    listIter li;
+    listNode *ln;
+    listRewind(g_pserver->masters, &li);
+    while ((ln = listNext(&li)))
+    {
+        redisMaster *mi = (redisMaster*)listNodeValue(ln);
+        serverAssert(mi->master == nullptr);
+        if (mi->cached_master != nullptr)
+            selectDb(mi->cached_master, 0);
+    }
+
     if (g_pserver->syslog_enabled) {
         openlog(g_pserver->syslog_ident, LOG_PID | LOG_NDELAY | LOG_NOWAIT,
             g_pserver->syslog_facility);
@@ -2928,7 +2965,7 @@ void initServer(void) {
     cserver.pid = getpid();
     g_pserver->clients_index = raxNew();
     g_pserver->clients_to_close = listCreate();
-    g_pserver->slaveseldb = -1; /* Force to emit the first SELECT command. */
+    g_pserver->replicaseldb = -1; /* Force to emit the first SELECT command. */
     g_pserver->ready_keys = listCreate();
     g_pserver->clients_waiting_acks = listCreate();
     g_pserver->get_ack_from_slaves = 0;
@@ -3320,6 +3357,7 @@ void call(client *c, int flags) {
     dirty = g_pserver->dirty;
     start = ustime();
     c->cmd->proc(c);
+    serverTL->commandsExecuted++;
     duration = ustime()-start;
     dirty = g_pserver->dirty-dirty;
     if (dirty < 0) dirty = 0;
@@ -3347,6 +3385,7 @@ void call(client *c, int flags) {
         latencyAddSampleIfNeeded(latency_event,duration/1000);
         slowlogPushEntryIfNeeded(c,c->argv,c->argc,duration);
     }
+
     if (flags & CMD_CALL_STATS) {
         /* use the real command that was executed (cmd and lastamc) may be
          * different, in case of MULTI-EXEC or re-written commands such as
@@ -3420,6 +3459,16 @@ void call(client *c, int flags) {
     ProcessPendingAsyncWrites();
     
     g_pserver->also_propagate = prev_also_propagate;
+
+    /* If the client has keys tracking enabled for client side caching,
+     * make sure to remember the keys it fetched via this command. */
+    if (c->cmd->flags & CMD_READONLY) {
+        client *caller = (c->flags & CLIENT_LUA && g_pserver->lua_caller) ?
+                            g_pserver->lua_caller : c;
+        if (caller->flags & CLIENT_TRACKING)
+            trackingRememberKeys(caller);
+    }
+
     g_pserver->stat_numcommands++;
 }
 
@@ -3495,7 +3544,7 @@ int processCommand(client *c, int callFlags) {
         if (acl_retval == ACL_DENIED_CMD)
             addReplyErrorFormat(c,
                 "-NOPERM this user has no permissions to run "
-                "the '%s' command or its subcommnad", c->cmd->name);
+                "the '%s' command or its subcommand", c->cmd->name);
         else
             addReplyErrorFormat(c,
                 "-NOPERM this user has no permissions to access "
@@ -3543,8 +3592,8 @@ int processCommand(client *c, int callFlags) {
      * propagation of DELs due to eviction. */
     if (g_pserver->maxmemory && !g_pserver->lua_timedout) {
         int out_of_memory = freeMemoryIfNeededAndSafe() == C_ERR;
-        /* freeMemoryIfNeeded may flush slave output buffers. This may result
-         * into a slave, that may be the active client, to be freed. */
+        /* freeMemoryIfNeeded may flush replica output buffers. This may result
+         * into a replica, that may be the active client, to be freed. */
         if (serverTL->current_client == NULL) return C_ERR;
 
         /* It was impossible to free enough memory, and the command the client
@@ -3591,7 +3640,7 @@ int processCommand(client *c, int callFlags) {
         return C_OK;
     }
 
-    /* Don't accept write commands if this is a read only slave. But
+    /* Don't accept write commands if this is a read only replica. But
      * accept write commands if this is our master. */
     if (listLength(g_pserver->masters) && g_pserver->repl_slave_ro &&
         !(c->flags & CLIENT_MASTER) &&
@@ -3614,7 +3663,7 @@ int processCommand(client *c, int callFlags) {
     }
 
     /* Only allow commands with flag "t", such as INFO, SLAVEOF and so on,
-     * when slave-serve-stale-data is no and we are a slave with a broken
+     * when replica-serve-stale-data is no and we are a replica with a broken
      * link with master. */
     if (FBrokenLinkToMaster() &&
         g_pserver->repl_serve_stale_data == 0 &&
@@ -3657,6 +3706,7 @@ int processCommand(client *c, int callFlags) {
         queueMultiCommand(c);
         addReply(c,shared.queued);
     } else {
+        std::unique_lock<decltype(c->db->lock)> ulock(c->db->lock);
         call(c,callFlags);
         c->woff = g_pserver->master_repl_offset;
         if (listLength(g_pserver->ready_keys))
@@ -3746,7 +3796,7 @@ int prepareForShutdown(int flags) {
         unlink(cserver.pidfile);
     }
 
-    /* Best effort flush of slave output buffers, so that we hopefully
+    /* Best effort flush of replica output buffers, so that we hopefully
      * send them pending writes. */
     flushSlavesOutputBuffers();
 
@@ -4058,10 +4108,12 @@ sds genRedisInfoString(const char *section) {
             "connected_clients:%lu\r\n"
             "client_recent_max_input_buffer:%zu\r\n"
             "client_recent_max_output_buffer:%zu\r\n"
-            "blocked_clients:%d\r\n",
+            "blocked_clients:%d\r\n"
+            "current_client_thread:%d\r\n",
             listLength(g_pserver->clients)-listLength(g_pserver->slaves),
             maxin, maxout,
-            g_pserver->blocked_clients);
+            g_pserver->blocked_clients,
+            static_cast<int>(serverTL - g_pserver->rgthreadvar));
         for (int ithread = 0; ithread < cserver.cthreads; ++ithread)
         {
             info = sdscatprintf(info,
@@ -4342,7 +4394,8 @@ sds genRedisInfoString(const char *section) {
         info = sdscatprintf(info,
             "# Replication\r\n"
             "role:%s\r\n",
-            listLength(g_pserver->masters) == 0 ? "master" : "slave");
+            listLength(g_pserver->masters) == 0 ? "master" 
+                : g_pserver->fActiveReplica ? "active-replica" : "slave");
         if (listLength(g_pserver->masters)) {
             listIter li;
             listNode *ln;
@@ -4421,18 +4474,18 @@ sds genRedisInfoString(const char *section) {
 
             listRewind(g_pserver->slaves,&li);
             while((ln = listNext(&li))) {
-                client *slave = (client*)listNodeValue(ln);
+                client *replica = (client*)listNodeValue(ln);
                 const char *state = NULL;
-                char ip[NET_IP_STR_LEN], *slaveip = slave->slave_ip;
+                char ip[NET_IP_STR_LEN], *slaveip = replica->slave_ip;
                 int port;
                 long lag = 0;
 
                 if (slaveip[0] == '\0') {
-                    if (anetPeerToString(slave->fd,ip,sizeof(ip),&port) == -1)
+                    if (anetPeerToString(replica->fd,ip,sizeof(ip),&port) == -1)
                         continue;
                     slaveip = ip;
                 }
-                switch(slave->replstate) {
+                switch(replica->replstate) {
                 case SLAVE_STATE_WAIT_BGSAVE_START:
                 case SLAVE_STATE_WAIT_BGSAVE_END:
                     state = "wait_bgsave";
@@ -4445,14 +4498,14 @@ sds genRedisInfoString(const char *section) {
                     break;
                 }
                 if (state == NULL) continue;
-                if (slave->replstate == SLAVE_STATE_ONLINE)
-                    lag = time(NULL) - slave->repl_ack_time;
+                if (replica->replstate == SLAVE_STATE_ONLINE)
+                    lag = time(NULL) - replica->repl_ack_time;
 
                 info = sdscatprintf(info,
                     "slave%d:ip=%s,port=%d,state=%s,"
                     "offset=%lld,lag=%ld\r\n",
-                    slaveid,slaveip,slave->slave_listening_port,state,
-                    slave->repl_ack_off, lag);
+                    slaveid,slaveip,replica->slave_listening_port,state,
+                    (replica->repl_ack_off + replica->reploff_skipped), lag);
                 slaveid++;
             }
         }
@@ -4531,11 +4584,18 @@ sds genRedisInfoString(const char *section) {
             long long keys, vkeys;
 
             keys = dictSize(g_pserver->db[j].pdict);
-            vkeys = dictSize(g_pserver->db[j].expires);
+            vkeys = g_pserver->db[j].setexpire->size();
+
+            // Adjust TTL by the current time
+            g_pserver->db[j].avg_ttl -= (g_pserver->mstime - g_pserver->db[j].last_expire_set);
+            if (g_pserver->db[j].avg_ttl < 0)
+                g_pserver->db[j].avg_ttl = 0;
+            g_pserver->db[j].last_expire_set = g_pserver->mstime;
+            
             if (keys || vkeys) {
                 info = sdscatprintf(info,
                     "db%d:keys=%lld,expires=%lld,avg_ttl=%lld\r\n",
-                    j, keys, vkeys, g_pserver->db[j].avg_ttl);
+                    j, keys, vkeys, static_cast<long long>(g_pserver->db[j].avg_ttl));
             }
         }
     }
@@ -4553,7 +4613,7 @@ void infoCommand(client *c) {
 }
 
 void monitorCommand(client *c) {
-    /* ignore MONITOR if already slave or in monitor mode */
+    /* ignore MONITOR if already replica or in monitor mode */
     serverAssert(GlobalLocksAcquired());
     if (c->flags & CLIENT_SLAVE) return;
 
@@ -4780,7 +4840,7 @@ void loadDataFromDisk(void) {
                 while ((ln = listNext(&li)))
                 {
                     redisMaster *mi = (redisMaster*)listNodeValue(ln);
-                    /* If we are a slave, create a cached master from this
+                    /* If we are a replica, create a cached master from this
                     * information, in order to allow partial resynchronizations
                     * with masters. */
                     replicationCacheMasterUsingMyself(mi);
@@ -4798,6 +4858,12 @@ void redisOutOfMemoryHandler(size_t allocation_size) {
     serverLog(LL_WARNING,"Out Of Memory allocating %zu bytes!",
         allocation_size);
     serverPanic("Redis aborting for OUT OF MEMORY");
+}
+
+void fuzzOutOfMemoryHandler(size_t allocation_size) {
+    serverLog(LL_WARNING,"Out Of Memory allocating %zu bytes!",
+        allocation_size);
+    exit(EXIT_FAILURE); // don't crash because it causes false positives
 }
 
 void redisSetProcTitle(const char *title) {
@@ -4913,19 +4979,26 @@ int redisIsSupervised(int mode) {
 
 uint64_t getMvccTstamp()
 {
-    return g_pserver->mvcc_tstamp;
+    uint64_t rval;
+    __atomic_load(&g_pserver->mvcc_tstamp, &rval, __ATOMIC_ACQUIRE);
+    return rval;
 }
 
 void incrementMvccTstamp()
 {
-    uint64_t msPrev = g_pserver->mvcc_tstamp >> 20;
-    if (msPrev >= (uint64_t)g_pserver->mstime)  // we can be greater if the count overflows
+    uint64_t msPrev;
+    __atomic_load(&g_pserver->mvcc_tstamp, &msPrev, __ATOMIC_ACQUIRE);
+    msPrev >>= MVCC_MS_SHIFT;  // convert to milliseconds
+
+    long long mst;
+    __atomic_load(&g_pserver->mstime, &mst, __ATOMIC_RELAXED);
+    if (msPrev >= (uint64_t)mst)  // we can be greater if the count overflows
     {
         atomicIncr(g_pserver->mvcc_tstamp, 1);
     }
     else
     {
-        atomicSet(g_pserver->mvcc_tstamp, ((uint64_t)g_pserver->mstime) << 20);
+        atomicSet(g_pserver->mvcc_tstamp, ((uint64_t)g_pserver->mstime) << MVCC_MS_SHIFT);
     }
 }
 
@@ -5147,6 +5220,23 @@ int main(int argc, char **argv) {
     #endif
         moduleLoadFromQueue();
         ACLLoadUsersAtStartup();
+
+        // special case of FUZZING load from stdin then quit
+        if (argc > 1 && strstr(argv[1],"rdbfuzz-mode") != NULL)
+        {
+            zmalloc_set_oom_handler(fuzzOutOfMemoryHandler);
+#ifdef __AFL_HAVE_MANUAL_CONTROL
+            __AFL_INIT();
+#endif
+            rio rdb;
+            rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
+            startLoading(stdin);
+            rioInitWithFile(&rdb,stdin);
+            rdbLoadRio(&rdb,&rsi,0);
+            stopLoading();
+            return EXIT_SUCCESS;
+        }
+
         loadDataFromDisk();
         if (g_pserver->cluster_enabled) {
             if (verifyClusterConfigWithData() == C_ERR) {
@@ -5183,7 +5273,7 @@ int main(int argc, char **argv) {
 
     aeReleaseLock();    //Finally we can dump the lock
     moduleReleaseGIL(true);
-
+    
     serverAssert(cserver.cthreads > 0 && cserver.cthreads <= MAX_EVENT_LOOPS);
     pthread_t rgthread[MAX_EVENT_LOOPS];
     for (int iel = 0; iel < cserver.cthreads; ++iel)

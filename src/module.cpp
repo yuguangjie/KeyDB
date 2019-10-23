@@ -32,6 +32,7 @@
 #include <dlfcn.h>
 #include <mutex>
 #include <condition_variable>
+#include <sys/stat.h>
 
 #define REDISMODULE_CORE 1
 #include "redismodule.h"
@@ -565,7 +566,7 @@ void RedisModuleCommandDispatcher(client *c) {
     for (int i = 0; i < c->argc; i++) {
         /* Only do the work if the module took ownership of the object:
          * in that case the refcount is no longer 1. */
-        if (c->argv[i]->refcount > 1)
+        if (c->argv[i]->getrefcount(std::memory_order_relaxed) > 1)
             trimStringObjectIfNeeded(c->argv[i]);
     }
 }
@@ -1036,7 +1037,7 @@ int RM_StringCompare(RedisModuleString *a, RedisModuleString *b) {
 /* Return the (possibly modified in encoding) input 'str' object if
  * the string is unshared, otherwise NULL is returned. */
 RedisModuleString *moduleAssertUnsharedString(RedisModuleString *str) {
-    if (str->refcount != 1) {
+    if (str->getrefcount(std::memory_order_relaxed) != 1) {
         serverLog(LL_WARNING,
             "Module attempted to use an in-place string modify operation "
             "with a string referenced multiple times. Please check the code "
@@ -1252,6 +1253,17 @@ int RM_ReplyWithStringBuffer(RedisModuleCtx *ctx, const char *buf, size_t len) {
     return REDISMODULE_OK;
 }
 
+/* Reply with a bulk string, taking in input a C buffer pointer that is
+ * assumed to be null-terminated.
+ *
+ * The function always returns REDISMODULE_OK. */
+int RM_ReplyWithCString(RedisModuleCtx *ctx, const char *buf) {
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyBulkCString(c,(char*)buf);
+    return REDISMODULE_OK;
+}
+
 /* Reply with a bulk string, taking in input a RedisModuleString object.
  *
  * The function always returns REDISMODULE_OK. */
@@ -1427,7 +1439,7 @@ int RM_GetSelectedDb(RedisModuleCtx *ctx) {
  *
  *  * REDISMODULE_CTX_FLAGS_MASTER: The Redis instance is a master
  *
- *  * REDISMODULE_CTX_FLAGS_SLAVE: The Redis instance is a slave
+ *  * REDISMODULE_CTX_FLAGS_SLAVE: The Redis instance is a replica
  *
  *  * REDISMODULE_CTX_FLAGS_READONLY: The Redis instance is read-only
  *
@@ -1464,6 +1476,9 @@ int RM_GetContextFlags(RedisModuleCtx *ctx) {
 
     if (g_pserver->cluster_enabled)
         flags |= REDISMODULE_CTX_FLAGS_CLUSTER;
+
+    if (g_pserver->loading)
+        flags |= REDISMODULE_CTX_FLAGS_LOADING;
 
     /* Maxmemory and eviction policy */
     if (g_pserver->maxmemory > 0) {
@@ -1629,7 +1644,11 @@ int RM_UnlinkKey(RedisModuleKey *key) {
  * If no TTL is associated with the key or if the key is empty,
  * REDISMODULE_NO_EXPIRE is returned. */
 mstime_t RM_GetExpire(RedisModuleKey *key) {
-    mstime_t expire = getExpire(key->db,key->key);
+    expireEntry *pexpire = getExpire(key->db,key->key);
+    mstime_t expire = -1;
+    if (pexpire != nullptr)
+        pexpire->FGetPrimaryExpire(&expire);
+    
     if (expire == -1 || key->value == NULL) return -1;
     expire -= mstime();
     return expire >= 0 ? expire : 0;
@@ -1649,7 +1668,7 @@ int RM_SetExpire(RedisModuleKey *key, mstime_t expire) {
         return REDISMODULE_ERR;
     if (expire != REDISMODULE_NO_EXPIRE) {
         expire += mstime();
-        setExpire(key->ctx->client,key->db,key->key,expire);
+        setExpire(key->ctx->client,key->db,key->key,nullptr,expire);
     } else {
         removeExpire(key->db,key->key);
     }
@@ -3920,7 +3939,9 @@ RedisModuleCtx *RM_GetThreadSafeContext(RedisModuleBlockedClient *bc) {
 
 /* Release a thread safe context. */
 void RM_FreeThreadSafeContext(RedisModuleCtx *ctx) {
+    moduleAcquireGIL(false /*fServerThread*/);
     moduleFreeContext(ctx);
+    moduleReleaseGIL(false /*fServerThread*/);
     zfree(ctx);
 }
 
@@ -3930,6 +3951,8 @@ void RM_FreeThreadSafeContext(RedisModuleCtx *ctx) {
 void RM_ThreadSafeContextLock(RedisModuleCtx *ctx) {
     UNUSED(ctx);
     moduleAcquireGIL(FALSE /*fServerThread*/);
+    if (serverTL == nullptr)
+        serverTL = &g_pserver->rgthreadvar[IDX_EVENT_LOOP_MAIN];    // arbitrary module threads get the main thread context
 }
 
 /* Release the server lock after a thread safe API call was executed. */
@@ -4266,7 +4289,7 @@ size_t RM_GetClusterSize(void) {
  *
  * The arguments ip, master_id, port and flags can be NULL in case we don't
  * need to populate back certain info. If an ip and master_id (only populated
- * if the instance is a slave) are specified, they point to buffers holding
+ * if the instance is a replica) are specified, they point to buffers holding
  * at least REDISMODULE_NODE_ID_LEN bytes. The strings written back as ip
  * and master_id are not null terminated.
  *
@@ -4277,7 +4300,7 @@ size_t RM_GetClusterSize(void) {
  * * REDISMODULE_NODE_SLAVE         The node is a replica
  * * REDISMODULE_NODE_PFAIL         We see the node as failing
  * * REDISMODULE_NODE_FAIL          The cluster agrees the node is failing
- * * REDISMODULE_NODE_NOFAILOVER    The slave is configured to never failover
+ * * REDISMODULE_NODE_NOFAILOVER    The replica is configured to never failover
  */
 
 clusterNode *clusterLookupNode(const char *name); /* We need access to internals */
@@ -5158,7 +5181,7 @@ void moduleInitModulesSystem(void) {
  * The function aborts the server on errors, since to start with missing
  * modules is not considered sane: clients may rely on the existence of
  * given commands, loading AOF also may need some modules to exist, and
- * if this instance is a slave, it must understand commands from master. */
+ * if this instance is a replica, it must understand commands from master. */
 void moduleLoadFromQueue(void) {
     listIter li;
     listNode *ln;
@@ -5212,6 +5235,15 @@ int moduleLoad(const char *path, void **module_argv, int module_argc) {
     int (*onload)(void *, void **, int);
     void *handle;
     RedisModuleCtx ctx = REDISMODULE_CTX_INIT;
+    
+    struct stat st;
+    if (stat(path, &st) == 0)
+    {   // this check is best effort
+        if (!(st.st_mode & (S_IXUSR  | S_IXGRP | S_IXOTH))) {
+            serverLog(LL_WARNING, "Module %s failed to load: It does not have execute permissions.", path);
+            return C_ERR;
+        }
+    }
 
     handle = dlopen(path,RTLD_NOW|RTLD_LOCAL);
     if (handle == NULL) {

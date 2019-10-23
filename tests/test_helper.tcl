@@ -35,12 +35,14 @@ set ::all_tests {
     unit/quit
     unit/aofrw
     unit/acl
+    unit/rreplay
     integration/block-repl
     integration/replication
     integration/replication-2
     integration/replication-3
     integration/replication-4
     integration/replication-psync
+    integration/replication-active
     integration/aof
     integration/rdb
     integration/convert-zipmap-hash-on-load
